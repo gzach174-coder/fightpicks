@@ -71,6 +71,56 @@ const getErrorMessage = (error: any): string => {
   return parts.length > 0 ? parts.join(' | ') : 'Unknown error'
 }
 
+// --- Event status helper ---
+type EventStatus = {
+  status: string
+  subtitle: string
+  bgColor: string
+}
+
+const getEventStatus = (event: Event): EventStatus => {
+  const lockTime = event.lock_time ? new Date(event.lock_time).getTime() : null
+  const now = Date.now()
+  const isLocked = lockTime && now >= lockTime
+  const isOpen = event.results_open === true
+
+  if (!lockTime) {
+    return {
+      status: 'Picks Open',
+      subtitle: 'Lock time not set',
+      bgColor: '#d1fae5', // light green
+    }
+  }
+
+  if (!isLocked) {
+    const msRemaining = lockTime - now
+    const secondsRemaining = Math.max(0, Math.floor(msRemaining / 1000))
+    const hours = Math.floor(secondsRemaining / 3600)
+    const minutes = Math.floor((secondsRemaining % 3600) / 60)
+    const countdown = `${hours}h ${minutes}m`
+
+    return {
+      status: 'Picks Open',
+      subtitle: `Locks in ${countdown}`,
+      bgColor: '#d1fae5', // light green
+    }
+  }
+
+  if (isOpen) {
+    return {
+      status: 'Results Live',
+      subtitle: 'Results are open for this event',
+      bgColor: '#ddd6fe', // light purple
+    }
+  }
+
+  return {
+    status: 'Picks Locked',
+    subtitle: 'Waiting for results',
+    bgColor: '#f3f4f6', // light gray
+  }
+}
+
 // --- AUTH COMPONENT (REAL SUPABASE AUTH) ---
 function Auth({ user, setUser }: { user: any; setUser: (user: any) => void }) {
   const [email, setEmail] = useState('')
@@ -176,12 +226,24 @@ export default function HomePage() {
   const [loadingEvents, setLoadingEvents] = useState(false)
   const [loadingPicks, setLoadingPicks] = useState(false)
   const [loadingLeaderboards, setLoadingLeaderboards] = useState(false)
+  const [finishingEvent, setFinishingEvent] = useState<Record<string, boolean>>({})
+  const [clearingEvent, setClearingEvent] = useState<Record<string, boolean>>({})
+  const [timeCounter, setTimeCounter] = useState(0)
 
   const rounds = useMemo(() => [1, 2, 3, 4, 5], [])
   const finishes: FinishType[] = useMemo(
     () => ['submission', 'knockout', 'decision - unanimous', 'decision - split', 'no contest'],
     []
   )
+
+  // --- Timer for countdown updates (every 30 seconds) ---
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setTimeCounter((prev) => prev + 1)
+    }, 30000)
+
+    return () => clearInterval(interval)
+  }, [])
 
   // --- Fetch events & fights ---
   useEffect(() => {
@@ -646,6 +708,182 @@ export default function HomePage() {
     await fetchLeaderboards()
   }
 
+  // --- Admin: Finish Event (open results + optionally lock all fights) ---
+  const handleAdminFinishEvent = async (event: EventWithFights) => {
+    if (!isAdmin) return alert('Not authorized.')
+
+    setFinishingEvent((prev) => ({ ...prev, [event.id]: true }))
+
+    try {
+      // Step (a): Open results
+      const { error: openError } = await supabase.rpc('admin_set_event_results_open', {
+        p_event_id: event.id,
+        p_open: true,
+      })
+
+      if (openError) {
+        console.error('Admin finish event (open results) error:', openError)
+        alert(getErrorMessage(openError))
+        setFinishingEvent((prev) => ({ ...prev, [event.id]: false }))
+        return
+      }
+
+      // Step (b): Ask for confirmation to lock all fight results
+      const shouldLock = window.confirm('Lock all fight results for this event now?')
+
+      if (shouldLock) {
+        const lockErrors: string[] = []
+
+        for (const fight of event.fights) {
+          const { error: lockError } = await supabase.rpc('admin_set_results_locked', {
+            p_fight_id: fight.id,
+            p_locked: true,
+          })
+
+          if (lockError) {
+            lockErrors.push(`${fight.fighter_red} vs ${fight.fighter_blue}: ${getErrorMessage(lockError)}`)
+          }
+        }
+
+        if (lockErrors.length > 0) {
+          alert(`Some fights failed to lock:\n\n${lockErrors.join('\n')}`)
+        }
+      }
+
+      // Step (c): Re-fetch events/fights and leaderboards
+      const { data: events, error: eventsError } = await supabase
+        .from('events')
+        .select('id, name, event_date, lock_time, results_open')
+        .order('event_date', { ascending: true })
+
+      const { data: fights, error: fightsError } = await supabase
+        .from('fights')
+        .select('*')
+        .order('fight_time', { ascending: true })
+
+      if (!events || !fights || eventsError || fightsError) {
+        console.error('Re-fetch error:', eventsError || fightsError)
+        setFinishingEvent((prev) => ({ ...prev, [event.id]: false }))
+        return
+      }
+
+      const combined: EventWithFights[] = events.map((e) => ({
+        ...e,
+        fights: fights.filter((f) => f.event_id === e.id),
+      }))
+
+      setEventsWithFights(combined)
+
+      // Re-fetch leaderboards
+      await fetchLeaderboards()
+
+      // Step (d): Success alert
+      alert('Event finished. Results are open.')
+    } finally {
+      setFinishingEvent((prev) => ({ ...prev, [event.id]: false }))
+    }
+  }
+
+  // --- Admin: Clear Results (unlock all fights and clear their results) ---
+  const handleAdminClearResults = async (event: EventWithFights) => {
+    if (!isAdmin) return alert('Not authorized.')
+
+    // Confirm with user
+    const shouldClear = window.confirm('This will clear ALL results for this event and close results. Continue?')
+    if (!shouldClear) return
+
+    setClearingEvent((prev) => ({ ...prev, [event.id]: true }))
+
+    try {
+      const errors: string[] = []
+
+      // Step (a): Open results for the event
+      const { error: openError } = await supabase.rpc('admin_set_event_results_open', {
+        p_event_id: event.id,
+        p_open: true,
+      })
+
+      if (openError) {
+        console.error('Admin clear results (open results) error:', openError)
+        alert(getErrorMessage(openError))
+        setClearingEvent((prev) => ({ ...prev, [event.id]: false }))
+        return
+      }
+
+      // Step (b): For each fight, unlock results and clear result fields
+      for (const fight of event.fights) {
+        // Unlock results
+        const { error: unlockError } = await supabase.rpc('admin_set_results_locked', {
+          p_fight_id: fight.id,
+          p_locked: false,
+        })
+
+        if (unlockError) {
+          errors.push(`${fight.id} (unlock): ${getErrorMessage(unlockError)}`)
+        }
+
+        // Clear result fields
+        const { error: clearError } = await supabase.rpc('admin_set_fight_result', {
+          p_fight_id: fight.id,
+          p_actual_winner: null,
+          p_actual_finish_type: null,
+          p_actual_round: null,
+        })
+
+        if (clearError) {
+          errors.push(`${fight.id} (clear): ${getErrorMessage(clearError)}`)
+        }
+      }
+
+      // Step (c): Close results for the event
+      const { error: closeError } = await supabase.rpc('admin_set_event_results_open', {
+        p_event_id: event.id,
+        p_open: false,
+      })
+
+      if (closeError) {
+        console.error('Admin clear results (close results) error:', closeError)
+        errors.push(`Event close: ${getErrorMessage(closeError)}`)
+      }
+
+      // Step (d): Re-fetch events/fights and leaderboards
+      const { data: events, error: eventsError } = await supabase
+        .from('events')
+        .select('id, name, event_date, lock_time, results_open')
+        .order('event_date', { ascending: true })
+
+      const { data: fights, error: fightsError } = await supabase
+        .from('fights')
+        .select('*')
+        .order('fight_time', { ascending: true })
+
+      if (!events || !fights || eventsError || fightsError) {
+        console.error('Re-fetch error:', eventsError || fightsError)
+        setClearingEvent((prev) => ({ ...prev, [event.id]: false }))
+        return
+      }
+
+      const combined: EventWithFights[] = events.map((e) => ({
+        ...e,
+        fights: fights.filter((f) => f.event_id === e.id),
+      }))
+
+      setEventsWithFights(combined)
+
+      // Re-fetch leaderboards
+      await fetchLeaderboards()
+
+      // Step (e): Show result alert
+      if (errors.length > 0) {
+        alert(`Some operations failed:\n\n${errors.join('\n')}`)
+      } else {
+        alert('Results cleared.')
+      }
+    } finally {
+      setClearingEvent((prev) => ({ ...prev, [event.id]: false }))
+    }
+  }
+
   const lockedCount = user ? Object.values(picks).filter((p) => p.locked).length : 0
 
   return (
@@ -749,6 +987,31 @@ export default function HomePage() {
               {new Date(event.event_date).toLocaleDateString()}
             </p>
 
+            {/* Event Status Banner */}
+            {(() => {
+              const eventStatus = getEventStatus(event)
+              return (
+                <div style={{ marginBottom: 12, display: 'flex', alignItems: 'center', gap: 10 }}>
+                  <div
+                    style={{
+                      display: 'inline-block',
+                      padding: '4px 12px',
+                      borderRadius: 20,
+                      background: eventStatus.bgColor,
+                      fontSize: 13,
+                      fontWeight: 700,
+                      color: '#111',
+                    }}
+                  >
+                    {eventStatus.status}
+                  </div>
+                  <div style={{ fontSize: 12, color: '#666' }}>
+                    {eventStatus.subtitle}
+                  </div>
+                </div>
+              )
+            })()}
+
             {/* Admin Event Controls */}
             {isAdmin && (
               <div style={{ marginBottom: 12, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
@@ -783,6 +1046,38 @@ export default function HomePage() {
                   }}
                 >
                   Close Results
+                </button>
+                <button
+                  onClick={() => handleAdminFinishEvent(event)}
+                  disabled={finishingEvent[event.id]}
+                  style={{
+                    padding: '6px 12px',
+                    borderRadius: 6,
+                    background: finishingEvent[event.id] ? '#d1d5db' : '#8b5cf6',
+                    color: '#fff',
+                    border: 'none',
+                    fontWeight: 600,
+                    fontSize: 12,
+                    cursor: finishingEvent[event.id] ? 'not-allowed' : 'pointer',
+                  }}
+                >
+                  {finishingEvent[event.id] ? 'Finishing...' : 'Finish Event'}
+                </button>
+                <button
+                  onClick={() => handleAdminClearResults(event)}
+                  disabled={clearingEvent[event.id]}
+                  style={{
+                    padding: '6px 12px',
+                    borderRadius: 6,
+                    background: clearingEvent[event.id] ? '#d1d5db' : '#ef4444',
+                    color: '#fff',
+                    border: 'none',
+                    fontWeight: 600,
+                    fontSize: 12,
+                    cursor: clearingEvent[event.id] ? 'not-allowed' : 'pointer',
+                  }}
+                >
+                  {clearingEvent[event.id] ? 'Clearing...' : 'Clear Results'}
                 </button>
               </div>
             )}
